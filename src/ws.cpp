@@ -13,7 +13,9 @@ void log(const std::string& s) {
     std::cout << s << "\n";
 }
 
-Connection::Connection(std::unique_ptr<net::TcpSocket> sock) : sock_(std::move(sock)) {}
+Connection::Connection(std::unique_ptr<net::TcpSocket> sock) : sock_(std::move(sock)) {
+    closing_ = false;
+}
 
 int Connection::fd() const { return sock_->fd(); }
 
@@ -80,6 +82,19 @@ bool Connection::sendFrame(Opcode op, const uint8_t* data, size_t len) {
     }
     frame.insert(frame.end(), data, data + len);
     return sock_->sendAll(frame.data(), frame.size());
+}
+
+bool Connection::replyCloseFrame(uint16_t code, const std::string& reason){
+    if (closing_) return false;  // 幂等性检查
+        closing_ = true;
+    // 构造 Close 帧
+    // Opcode = 0x8 (Close), 前 2 字节为关闭码，后面为可选的 reason 文本
+    std::vector<uint8_t> payload;
+    payload.push_back((code >> 8) & 0xFF);
+    payload.push_back(code & 0xFF);
+    payload.insert(payload.end(), reason.begin(), reason.end());
+    
+    return sendFrame(Opcode::Close, payload.data(), payload.size());
 }
 
 bool Connection::sendText(const std::string& text) {

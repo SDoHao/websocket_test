@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
         }
     });
     server.setOnClose([](ws::Connection& conn) {
+        conn.replyCloseFrame(1000, "OK"); 
         ws::log("[Echo] Client " + std::to_string(conn.fd()) + " requested close");
     });
     if (!server.start("0.0.0.0", port)) {

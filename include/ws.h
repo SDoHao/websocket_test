@@ -19,6 +19,7 @@ struct Frame {
 };
 
 class Connection {
+    bool closing_;
     std::unique_ptr<net::TcpSocket> sock_;
 public:
     explicit Connection(std::unique_ptr<net::TcpSocket> sock);
@@ -27,6 +28,7 @@ public:
     bool readFrame(Frame& frame);
     bool sendFrame(Opcode op, const uint8_t* data, size_t len);
     bool sendText(const std::string& text);
+    bool replyCloseFrame(uint16_t code = 1000, const std::string& reason = "");
 };
 
 class Server {
