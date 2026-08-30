@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebSocket Echo 测试页（连接你的 C++ 服务器）</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 720px; margin: 40px auto; padding: 0 20px; color: #1f2329; }
+  h1 { font-size: 20px; }
+  .field { margin: 14px 0; }
+  input, textarea { width: 100%; padding: 10px; font-size: 14px;
+                    border: 1px solid #d0d7de; border-radius: 6px; box-sizing: border-box; }
+  button { padding: 9px 16px; font-size: 14px; border: none; border-radius: 6px;
+           cursor: pointer; background: #0969da; color: #fff; margin-right: 8px; }
+  button:disabled { background: #bbb; cursor: not-allowed; }
+  #status { font-weight: 600; }
+  .open { color: #1a7f37; }
+  .closed { color: #cf222e; }
+  #log { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
+         padding: 12px; height: 240px; overflow-y: auto; font-family: ui-monospace, monospace;
+         font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+  .hint { color: #57606a; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>WebSocket Echo 测试页</h1>
+  <p class="hint">用于验证你的 C++ 服务器（ws_echo_server）。浏览器会自动完成握手、帧编解码与掩码，你只需观察现象。</p>
+
+  <div class="field">
+    <input id="url" value="ws://127.0.0.1:8080" placeholder="ws://127.0.0.1:8080">
+  </div>
+  <div class="field">
+    <button id="btnConnect">连接</button>
+    <button id="btnClose" disabled>断开</button>
+    <span id="status" class="closed">● 未连接</span>
+  </div>
+
+  <div class="field">
+    <textarea id="msg" rows="3" placeholder="输入要发送的文本，点「发送文本」"></textarea>
+  </div>
+  <div class="field">
+    <button id="btnSendText">发送文本帧</button>
+    <button id="btnSendBin">发送二进制帧</button>
+    <button id="btnPing">发送 Ping（测心跳）</button>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+  const log = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+  let ws = null;
+
+  function println(s) {
+    const line = document.createElement('div');
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${s}`;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function setStatus(open) {
+    if (open) {
+      statusEl.textContent = '● 已连接';
+      statusEl.className = 'open';
+      document.getElementById('btnConnect').disabled = true;
+      document.getElementById('btnClose').disabled = false;
+    } else {
+      statusEl.textContent = '● 未连接';
+      statusEl.className = 'closed';
+      document.getElementById('btnConnect').disabled = false;
+      document.getElementById('btnClose').disabled = true;
+    }
+  }
+
+  document.getElementById('btnConnect').onclick = () => {
+    ws = new WebSocket(document.getElementById('url').value);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      setStatus(true);
+      println('✅ 连接建立（服务器已完成 101 握手）');
+    };
+    ws.onmessage = (e) => {
+      if (typeof e.data === 'string') {
+        println('⬅ 收到文本帧回显: ' + e.data);
+      } else {
+        const bytes = new Uint8Array(e.data);
+        println('⬅ 收到二进制帧回显: ' + bytes.length + ' 字节: ' +
+                Array.from(bytes.slice(0, 32)).join(','));
+      }
+    };
+    ws.onclose = (e) => {
+      setStatus(false);
+      println(`🔌 连接关闭 code=${e.code}`);
+    };
+    ws.onerror = () => println('⚠️ 连接错误');
+  };
+
+  document.getElementById('btnClose').onclick = () => ws && ws.close();
+
+  document.getElementById('btnSendText').onclick = () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { println('⚠️ 请先连接'); return; }
+    const t = document.getElementById('msg').value || 'hello websocket';
+    ws.send(t);
+    println('➡ 已发送文本帧: ' + t);
+  };
+
+  document.getElementById('btnSendBin').onclick = () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { println('⚠️ 请先连接'); return; }
+    // 构造 4 字节二进制数据，模拟未来传视频帧
+    const bin = new Uint8Array([0x00, 0xFF, 0x12, 0x34, 0x56]);
+    ws.send(bin.buffer);
+    println('➡ 已发送二进制帧: ' + bin.length + ' 字节');
+  };
+
+  document.getElementById('btnPing').onclick = () => {
+    // 浏览器原生 API 不暴露手动 ping，这里用空文本模拟说明
+    // 实际上 Chrome 会自动发送 ping/pong 维持连接，服务器端会打印日志
+    println('ℹ️ 浏览器会自动处理 Ping/Pong 心跳（服务器端日志会显示 [recv] PING）');
+  };
+</script>
+</body>
+</html>
