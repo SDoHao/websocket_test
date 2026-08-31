@@ -32,6 +32,24 @@ bool TcpSocket::bindAndListen(const std::string& ip, uint16_t port) {
     return ::listen(fd_, 128) == 0;
 }
 
+bool TcpSocket::connect(const std::string& host, uint16_t port) {
+    fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd_ < 0) return false;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        close();
+        return false;
+    }
+    if (::connect(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        close();
+        return false;
+    }
+    return true;
+}
+
 std::unique_ptr<TcpSocket> TcpSocket::accept() {
     sockaddr_in peer{};
     socklen_t len = sizeof(peer);

@@ -3,6 +3,8 @@
 #include <iostream>
 #include <cstring>
 #include <thread>
+#include <random>
+#include <chrono>
 
 namespace ws {
 
@@ -11,6 +13,62 @@ static std::mutex g_log_mtx;
 void log(const std::string& s) {
     std::lock_guard<std::mutex> lock(g_log_mtx);
     std::cout << s << "\n";
+}
+
+// ---------- 共享帧收发（服务端 / 客户端通用） ----------
+bool readFrame(net::TcpSocket& sock, Frame& frame) {
+    uint8_t hdr[2];
+    if (!sock.recvAll(hdr, 2)) return false;
+    frame.fin = (hdr[0] & 0x80) != 0;
+    frame.opcode = static_cast<Opcode>(hdr[0] & 0x0F);
+    bool masked = (hdr[1] & 0x80) != 0;
+    uint64_t len = hdr[1] & 0x7F;
+    if (len == 126) {
+        uint8_t ext[2]; if (!sock.recvAll(ext, 2)) return false;
+        len = ((uint64_t)ext[0] << 8) | ext[1];
+    } else if (len == 127) {
+        uint8_t ext[8]; if (!sock.recvAll(ext, 8)) return false;
+        len = 0; for (int i = 0; i < 8; ++i) len = (len << 8) | ext[i];
+    }
+    uint8_t mask_key[4] = {0};
+    if (masked && !sock.recvAll(mask_key, 4)) return false;
+    frame.payload.resize((size_t)len);
+    if (len > 0 && !sock.recvAll(frame.payload.data(), (size_t)len)) return false;
+    if (masked) for (size_t i = 0; i < frame.payload.size(); ++i) frame.payload[i] ^= mask_key[i % 4];
+    return true;
+}
+
+static void random_bytes(uint8_t* out, size_t n) {
+    static std::mt19937_64 rng([]{
+        std::random_device rd;
+        uint64_t t = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+        return (uint64_t(rd()) << 32) ^ uint64_t(rd()) ^ t;
+    }());
+    for (size_t i = 0; i < n; ++i) out[i] = (uint8_t)(rng() & 0xff);
+}
+
+bool sendFrameTo(net::TcpSocket& sock, Opcode op, const uint8_t* data, size_t len, bool mask) {
+    std::vector<uint8_t> frame;
+    frame.push_back(0x80 | static_cast<uint8_t>(op));
+    uint8_t maskbit = mask ? 0x80 : 0x00;
+    if (len < 126) frame.push_back(maskbit | (uint8_t)len);
+    else if (len < 65536) {
+        frame.push_back(maskbit | 126);
+        frame.push_back((uint8_t)((len >> 8) & 0xff));
+        frame.push_back((uint8_t)(len & 0xff));
+    } else {
+        frame.push_back(maskbit | 127);
+        for (int i = 7; i >= 0; --i) frame.push_back((uint8_t)(len >> (8 * i)));
+    }
+    if (mask) {
+        uint8_t mk[4];
+        random_bytes(mk, 4);
+        frame.insert(frame.end(), mk, mk + 4);
+        for (size_t i = 0; i < len; ++i) frame.push_back((uint8_t)data[i] ^ mk[i % 4]);
+    } else {
+        frame.insert(frame.end(), data, data + len);
+    }
+    return sock.sendAll(frame.data(), frame.size());
 }
 
 Connection::Connection(std::unique_ptr<net::TcpSocket> sock) : sock_(std::move(sock)) {
@@ -47,41 +105,11 @@ bool Connection::handshake() {
 }
 
 bool Connection::readFrame(Frame& frame) {
-    uint8_t hdr[2];
-    if (!sock_->recvAll(hdr, 2)) return false;
-    frame.fin = (hdr[0] & 0x80) != 0;
-    frame.opcode = static_cast<Opcode>(hdr[0] & 0x0F);
-    bool masked = (hdr[1] & 0x80) != 0;
-    uint64_t len = hdr[1] & 0x7F;
-    if (len == 126) {
-        uint8_t ext[2]; if (!sock_->recvAll(ext, 2)) return false;
-        len = ((uint64_t)ext[0] << 8) | ext[1];
-    } else if (len == 127) {
-        uint8_t ext[8]; if (!sock_->recvAll(ext, 8)) return false;
-        len = 0; for (int i = 0; i < 8; ++i) len = (len << 8) | ext[i];
-    }
-    uint8_t mask_key[4] = {0};
-    if (masked && !sock_->recvAll(mask_key, 4)) return false;
-    frame.payload.resize(len);
-    if (len > 0 && !sock_->recvAll(frame.payload.data(), len)) return false;
-    if (masked) for (size_t i = 0; i < frame.payload.size(); ++i) frame.payload[i] ^= mask_key[i % 4];
-    return true;
+    return ws::readFrame(*sock_, frame);
 }
 
 bool Connection::sendFrame(Opcode op, const uint8_t* data, size_t len) {
-    std::vector<uint8_t> frame;
-    frame.push_back(0x80 | static_cast<uint8_t>(op));
-    if (len < 126) frame.push_back((uint8_t)len);
-    else if (len < 65536) {
-        frame.push_back(126);
-        frame.push_back((uint8_t)((len >> 8) & 0xff));
-        frame.push_back((uint8_t)(len & 0xff));
-    } else {
-        frame.push_back(127);
-        for (int i = 7; i >= 0; --i) frame.push_back((uint8_t)(len >> (8 * i)));
-    }
-    frame.insert(frame.end(), data, data + len);
-    return sock_->sendAll(frame.data(), frame.size());
+    return ws::sendFrameTo(*sock_, op, data, len, false);
 }
 
 bool Connection::replyCloseFrame(uint16_t code, const std::string& reason){

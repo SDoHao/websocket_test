@@ -18,6 +18,11 @@ struct Frame {
     std::vector<uint8_t> payload;
 };
 
+// 共享的帧收发（服务端、客户端通用）。
+// readFrame 兼容带/不带 mask 的帧；sendFrameTo 的 mask=true 时发送带 mask 的帧（客户端→服务端必需）。
+bool readFrame(net::TcpSocket& sock, Frame& frame);
+bool sendFrameTo(net::TcpSocket& sock, Opcode op, const uint8_t* data, size_t len, bool mask);
+
 class Connection {
     bool closing_;
     std::unique_ptr<net::TcpSocket> sock_;

@@ -32,6 +32,7 @@ public:
     int fd() const { return fd_; }
     bool isValid() const { return fd_ >= 0; }
     bool bindAndListen(const std::string& ip, uint16_t port);
+    bool connect(const std::string& host, uint16_t port);
     std::unique_ptr<TcpSocket> accept();
     bool recvAll(uint8_t* buf, size_t n);
     bool sendAll(const uint8_t* buf, size_t n);
