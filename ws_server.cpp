@@ -25,7 +25,10 @@ int main(int argc, char** argv) {
             ws::log("[Echo] Received text: " + text);
             conn.sendText(text);
         } else if (frame.opcode == ws::Opcode::Bin) {
-            ws::log("[fd=" + std::to_string(conn.fd()) + "] Received BIN");
+            // 二进制帧原样回显（模拟机械臂图传：jpg 作为不透明二进制 blob 透传）
+            ws::log("[fd=" + std::to_string(conn.fd()) + "] Received BIN, size="
+                    + std::to_string(frame.payload.size()) + " bytes -> echo back");
+            conn.sendFrame(ws::Opcode::Bin, frame.payload.data(), frame.payload.size());
         } else if (frame.opcode == ws::Opcode::Ping) {
             ws::log("[fd=" + std::to_string(conn.fd()) + "] Received PING -> reply PONG");
             conn.sendFrame(ws::Opcode::Pong, frame.payload.data(), frame.payload.size());

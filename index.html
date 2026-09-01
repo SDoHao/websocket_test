@@ -41,11 +41,30 @@
   </div>
   <div class="field">
     <button id="btnSendText">发送文本帧</button>
-    <button id="btnSendBin">发送二进制帧</button>
     <button id="btnPing">发送 Ping（测心跳）</button>
   </div>
 
+  <div class="field" style="border-top:1px solid #e5e7eb;padding-top:12px;">
+    <div style="font-size:13px;color:#57606a;margin-bottom:6px;">二进制图传（jpg）— 默认测试文件 0.jpg，也可自选其他 jpg</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <input type="file" id="fileInput" accept=".jpg,.jpeg,image/jpeg" style="flex:1;min-width:200px;">
+      <button id="btnSendImage" disabled>发送图片帧</button>
+    </div>
+    <div id="fileInfo" style="font-size:12px;color:#57606a;margin-top:4px;">未选择文件（请点击上方选择项目目录下的 0.jpg）</div>
+  </div>
+
   <div id="log"></div>
+
+
+  <div id="imageResult" style="display:none;margin-top:12px;">
+    <div style="font-size:13px;font-weight:600;margin-bottom:6px;">回显图片</div>
+    <img id="echoImage" style="max-width:100%;border:1px solid #d0d7de;border-radius:6px;">
+    <div style="margin-top:6px;">
+      <a id="downloadLink" download="echo.jpg" style="font-size:12px;color:#0969da;">下载回显图片</a>
+    </div>
+  </div>
+
+  
 
 <script>
   const log = document.getElementById('log');
@@ -86,8 +105,20 @@
         println('⬅ 收到文本帧回显: ' + e.data);
       } else {
         const bytes = new Uint8Array(e.data);
-        println('⬅ 收到二进制帧回显: ' + bytes.length + ' 字节: ' +
-                Array.from(bytes.slice(0, 32)).join(','));
+        println('⬅ 收到二进制帧回显: ' + bytes.length + ' 字节');
+        // 渲染为 jpg 图片
+        const blob = new Blob([e.data], { type: 'image/jpeg' });
+        const url = URL.createObjectURL(blob);
+        const img = document.getElementById('echoImage');
+        img.src = url;
+        document.getElementById('imageResult').style.display = 'block';
+        document.getElementById('downloadLink').href = url;
+        // 校验 jpg 文件头 FF D8 FF
+        if (bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) {
+          println('✅ 回显数据为有效 jpg 格式（文件头 FF D8 FF）');
+        } else {
+          println('⚠️ 回显数据不是标准 jpg 格式（文件头不匹配）');
+        }
       }
     };
     ws.onclose = (e) => {
@@ -106,12 +137,34 @@
     println('➡ 已发送文本帧: ' + t);
   };
 
-  document.getElementById('btnSendBin').onclick = () => {
+  // ---- 二进制图传：选择 jpg 文件并发送 ----
+  const fileInput = document.getElementById('fileInput');
+  const btnSendImage = document.getElementById('btnSendImage');
+  const fileInfo = document.getElementById('fileInfo');
+  let selectedFile = null;
+
+  fileInput.onchange = () => {
+    if (fileInput.files && fileInput.files[0]) {
+      selectedFile = fileInput.files[0];
+      fileInfo.textContent = '已选择: ' + selectedFile.name + ' (' + selectedFile.size + ' 字节)';
+      btnSendImage.disabled = false;
+    } else {
+      selectedFile = null;
+      fileInfo.textContent = '未选择文件（请点击上方选择项目目录下的 0.jpg）';
+      btnSendImage.disabled = true;
+    }
+  };
+
+  btnSendImage.onclick = () => {
     if (!ws || ws.readyState !== WebSocket.OPEN) { println('⚠️ 请先连接'); return; }
-    // 构造 4 字节二进制数据，模拟未来传视频帧
-    const bin = new Uint8Array([0x00, 0xFF, 0x12, 0x34, 0x56]);
-    ws.send(bin.buffer);
-    println('➡ 已发送二进制帧: ' + bin.length + ' 字节');
+    if (!selectedFile) { println('⚠️ 请先选择 jpg 文件'); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      ws.send(reader.result); // ArrayBuffer，浏览器自动作为二进制帧发送（带 mask）
+      println('➡ 已发送图片帧: ' + selectedFile.name + ' (' + selectedFile.size + ' 字节)');
+    };
+    reader.onerror = () => println('⚠️ 文件读取失败');
+    reader.readAsArrayBuffer(selectedFile);
   };
 
   document.getElementById('btnPing').onclick = () => {

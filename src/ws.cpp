@@ -140,12 +140,49 @@ void Server::handleClient(std::unique_ptr<net::TcpSocket> client) {
         return;
     }
     log("[fd=" + std::to_string(conn.fd()) + "] Handshake succeeded");
+
     Frame frame;
+    std::vector<uint8_t> fragBuf;    // 分片重组缓冲区
+    Opcode fragOpcode = Opcode::Text; // 当前消息的 opcode（取首帧）
+    bool inFrag = false;               // 是否处于分片消息中
+
     while (conn.readFrame(frame)) {
-        if (onMsg_) onMsg_(conn, frame);
-        if (frame.opcode == Opcode::Close) {
-            if (onClose_) onClose_(conn);
-            break;
+        // 控制帧（Close/Ping/Pong）按 RFC 6455 不可分片，直接交付
+        if (frame.opcode == Opcode::Close ||
+            frame.opcode == Opcode::Ping  ||
+            frame.opcode == Opcode::Pong) {
+            if (onMsg_) onMsg_(conn, frame);
+            if (frame.opcode == Opcode::Close) {
+                if (onClose_) onClose_(conn);
+                break;
+            }
+            continue;
+        }
+
+        // 数据帧分片重组
+        if (frame.opcode == Opcode::Cont) {
+            if (!inFrag) {
+                log("[fd=" + std::to_string(conn.fd()) + "] Protocol error: unexpected continuation frame");
+                break;
+            }
+            fragBuf.insert(fragBuf.end(), frame.payload.begin(), frame.payload.end());
+        } else {
+            // Text / Bin 首帧
+            fragOpcode = frame.opcode;
+            fragBuf = std::move(frame.payload);
+            inFrag = true;
+        }
+
+        if (frame.fin) {
+            // 一条完整消息重组完成，交给业务回调
+            Frame complete;
+            complete.opcode = fragOpcode;
+            complete.fin = true;
+            complete.payload = std::move(fragBuf);
+            fragBuf.clear();
+            inFrag = false;
+
+            if (onMsg_) onMsg_(conn, complete);
         }
     }
     log("[fd=" + std::to_string(conn.fd()) + "] Connection closed");
