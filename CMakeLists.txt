@@ -24,6 +24,10 @@ target_link_libraries(ws_client PRIVATE
     pthread
 )
 
+# 静态链接 C++ 运行库：解决高版本 g++ 编译产物在旧系统（CentOS 7 自带 gcc 4.8.5）
+# target_link_options(ws_server PRIVATE -static-libstdc++ -static-libgcc)
+# target_link_options(ws_client PRIVATE -static-libstdc++ -static-libgcc)
+
 if(WIN32)
     target_link_libraries(ws_server PRIVATE
         ws2_32

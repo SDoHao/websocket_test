@@ -1,7 +1,9 @@
 #!/bin/bash
+# 静态链接 libstdc++/libgcc：解决手动安装的高版本 g++ 编译产物
+# 在旧系统（如 CentOS 7 自带 gcc 4.8.5）运行时找不到新版 C++ 库的问题。
 echo "🔨 正在编译 WebSocket 框架..."
-g++ -std=c++17 -pthread -O2 -Iinclude src/*.cpp ws_server.cpp -o ws_server
-g++ -std=c++17 -pthread -O2 -Iinclude src/*.cpp ws_client.cpp -o ws_client
+g++ -std=c++17 -pthread -O2 -static-libstdc++ -static-libgcc -Iinclude src/*.cpp ws_server.cpp -o ws_server
+g++ -std=c++17 -pthread -O2 -static-libstdc++ -static-libgcc -Iinclude src/*.cpp ws_client.cpp -o ws_client
 
 # windows
 # g++ -std=c++17 -O2 -Iinclude src/*.cpp ws_server.cpp -o ws_server.exe -lws2_32 -pthread 

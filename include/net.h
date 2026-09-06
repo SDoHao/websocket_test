@@ -14,6 +14,7 @@
     #include <arpa/inet.h>
     #include <unistd.h>
     #include <sys/types.h>
+    #include <fcntl.h>      // fcntl() 函数，用于设置非阻塞（Linux）
 #endif
 
 namespace net {
@@ -31,6 +32,9 @@ public:
 
     int fd() const { return fd_; }
     bool isValid() const { return fd_ >= 0; }
+    // 设置为非阻塞模式（reactor/epoll 模式必需）。
+    // 非阻塞含义：recv/send 数据没齐时不等待，立即返回，稍后重试。
+    bool setNonBlocking();
     bool bindAndListen(const std::string& ip, uint16_t port);
     bool connect(const std::string& host, uint16_t port);
     std::unique_ptr<TcpSocket> accept();

@@ -17,6 +17,20 @@ TcpSocket& TcpSocket::operator=(TcpSocket&& o) noexcept {
     return *this;
 }
 
+bool TcpSocket::setNonBlocking() {
+    // 把 fd_ 的"文件描述符标志"加上 O_NONBLOCK（非阻塞）。
+    // 之后这个 socket 的 recv/send 都不会阻塞：数据不齐立刻返回 -1 并设置 errno=EAGAIN。
+    // Windows 用 ioctlsocket，Linux 用 fcntl，两套系统调用不同，用宏区分。
+#ifdef _WIN32
+    u_long mode = 1;  // 1 = 开启非阻塞
+    return ::ioctlsocket(fd_, FIONBIO, &mode) == 0;
+#else
+    int flags = ::fcntl(fd_, F_GETFL, 0);          // 先读出当前标志
+    if (flags < 0) return false;
+    return ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) == 0;  // 加上非阻塞位再写回
+#endif
+}
+
 bool TcpSocket::bindAndListen(const std::string& ip, uint16_t port) {
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (fd_ < 0) return false;
