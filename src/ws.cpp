@@ -26,6 +26,13 @@ namespace ws {
 
 static std::mutex g_log_mtx;
 
+// 写缓冲内存回收阈值（1 MB）。
+// 背景：clear() 只把 size 归零，capacity（vector 已分配的内存）不会释放，
+// 如果某个连接之前发过超大消息（比如一张几 MB 的图），这块内存会一直占着直到连接关闭。
+// 发完缓冲后若 capacity 超过该阈值，就整体释放，把内存还给系统。
+// 小于该值的消息（常规的小帧）永远不会触发，避免频繁分配开销。
+static constexpr size_t kWriteBufReclaimBytes = 1024 * 1024;
+
 void log(const std::string& s) {
     std::lock_guard<std::mutex> lock(g_log_mtx);
     std::cout << s << "\n";
@@ -214,6 +221,14 @@ void Connection::handleWrite() {
         // 全部发完了：清空缓冲，不再关心 EPOLLOUT，只等读
         writeBuf_.clear();
         writePos_ = 0;
+        // 内存回收：clear() 只把 size 归零，capacity（已分配的内存）还占着。
+        // 如果之前发过超大消息（如一张几 MB 的图），capacity 会一直保留到连接关闭，
+        // 这就是"发完内存不还"的内存泄漏点。
+        // 超过阈值就交换一个空 vector，把旧内存整体释放（capacity 归 0），
+        // 下次 enqueue 需要时再重新分配（低频大消息场景下这个开销可忽略）。
+        if (writeBuf_.capacity() > kWriteBufReclaimBytes) {
+            std::vector<uint8_t>().swap(writeBuf_);
+        }
         if (closing_) { close(); return; }   // 优雅关闭：关闭帧也发完了，真正关闭
         server_->modEvent(fd_, EPOLLIN);     // 把事件兴趣改回"只读"
     }
