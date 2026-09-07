@@ -1,12 +1,15 @@
 // ============================================================
-// ws.cpp —— WebSocket 协议层实现（epoll + reactor 版）
+// ws.cpp —— WebSocket 协议层实现（epoll + reactor，One-Loop-Per-Thread 版）
 //
-// 本文件依赖 Linux 特有的 epoll（<sys/epoll.h>），仅在 Linux 下编译运行。
-// 改造要点：
-//   1. 帧解析从"阻塞读 socket"改为"从内存缓冲解析"（parseFrameFromBuf）
-//   2. Connection 变成非阻塞状态机：Handshake → Reading → Closed
-//   3. Server 变成单线程 epoll 事件循环（reactor 模式）
-//   4. 保留旧 readFrame/sendFrameTo 给命令行客户端（阻塞模式）使用
+// 本文件依赖 Linux 特有的 epoll（<sys/epoll.h>）和 eventfd（<sys/eventfd.h>），
+// 仅在 Linux 下编译运行。
+// 架构（相比单线程版的核心变化）：
+//   1. Server 变成"主线程 Acceptor"：只负责 accept，然后把新连接分发给工作线程
+//   2. 新增 EventLoop：每个工作线程一个独立 epoll + eventfd 事件循环
+//   3. Connection 固定属于某一个 EventLoop，所有读写只在该 loop 线程发生
+//   4. 跨线程通信只有一条通道：主线程 accept 后往目标 loop 的
+//      pendingConns_（mutex 保护）+ eventfd 唤醒
+//   5. 保留旧 readFrame/sendFrameTo 给命令行客户端（阻塞模式）使用
 // ============================================================
 #include "ws.h"
 #include "ws_utils.h"
@@ -14,23 +17,21 @@
 #include <cstring>
 #include <random>
 #include <chrono>
-#include <unistd.h>       // close()
-#include <errno.h>        // errno / EAGAIN
-#include <fcntl.h>        // fcntl() / O_NONBLOCK（显式依赖，不靠头文件顺带包含）
-#include <sys/epoll.h>    // epoll 系列 API（Linux 专属）
-#include <sys/socket.h>   // accept/recv/send
-#include <arpa/inet.h>    // sockaddr_in
+#include <unistd.h>        // close()
+#include <errno.h>         // errno / EAGAIN
+#include <fcntl.h>         // fcntl() / O_NONBLOCK
+#include <sys/epoll.h>     // epoll 系列 API（Linux 专属）
+#include <sys/eventfd.h>   // eventfd()：跨线程唤醒"门铃"（Linux 专属）
+#include <sys/socket.h>    // accept/recv/send
+#include <arpa/inet.h>     // sockaddr_in
 #include <netinet/in.h>
 
 namespace ws {
 
 static std::mutex g_log_mtx;
 
-// 写缓冲内存回收阈值（1 MB）。
-// 背景：clear() 只把 size 归零，capacity（vector 已分配的内存）不会释放，
-// 如果某个连接之前发过超大消息（比如一张几 MB 的图），这块内存会一直占着直到连接关闭。
-// 发完缓冲后若 capacity 超过该阈值，就整体释放，把内存还给系统。
-// 小于该值的消息（常规的小帧）永远不会触发，避免频繁分配开销。
+// 写缓冲内存回收阈值（1 MB）。背景：clear() 只把 size 归零，capacity 不释放，
+// 发完超大消息（如一张几 MB 的图）后内存会一直占着；超过阈值就整体释放。
 static constexpr size_t kWriteBufReclaimBytes = 1024 * 1024;
 
 void log(const std::string& s) {
@@ -162,9 +163,9 @@ bool parseFrameFromBuf(const std::vector<uint8_t>& buf, size_t& offset, Frame& f
 }
 
 // ============================================================
-// Connection（非阻塞状态机版）
+// Connection（非阻塞状态机版，绑定所属 EventLoop）
 // ============================================================
-Connection::Connection(int fd, Server* server) : fd_(fd), server_(server) {}
+Connection::Connection(int fd, EventLoop* loop) : fd_(fd), loop_(loop) {}
 
 Connection::~Connection() {}
 
@@ -178,12 +179,10 @@ void Connection::handleRead() {
         // 非阻塞 recv：每次尽量多收。收完（EAGAIN）就退出循环
         ssize_t n = ::recv(fd_, tmp, sizeof(tmp), 0);
         if (n > 0) {
-            // 收到数据：追加进读缓冲（可能只是半包，先攒着）
-            readBuf_.insert(readBuf_.end(), tmp, tmp + n);
+            readBuf_.insert(readBuf_.end(), tmp, tmp + n);   // 数据先进读缓冲
+            continue;
         } else if (n == 0) {
-            // 对端关闭了连接（TCP FIN）
-            log("[fd=" + std::to_string(fd_) + "] peer closed");
-            close();
+            close();   // 对端关闭连接
             return;
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // 读完了，正常
@@ -222,15 +221,12 @@ void Connection::handleWrite() {
         writeBuf_.clear();
         writePos_ = 0;
         // 内存回收：clear() 只把 size 归零，capacity（已分配的内存）还占着。
-        // 如果之前发过超大消息（如一张几 MB 的图），capacity 会一直保留到连接关闭，
-        // 这就是"发完内存不还"的内存泄漏点。
-        // 超过阈值就交换一个空 vector，把旧内存整体释放（capacity 归 0），
-        // 下次 enqueue 需要时再重新分配（低频大消息场景下这个开销可忽略）。
+        // 超过阈值就交换一个空 vector，把旧内存整体释放（capacity 归 0）。
         if (writeBuf_.capacity() > kWriteBufReclaimBytes) {
             std::vector<uint8_t>().swap(writeBuf_);
         }
         if (closing_) { close(); return; }   // 优雅关闭：关闭帧也发完了，真正关闭
-        server_->modEvent(fd_, EPOLLIN);     // 把事件兴趣改回"只读"
+        loop_->modEvent(fd_, EPOLLIN);       // 把事件兴趣改回"只读"
     }
 }
 
@@ -239,8 +235,8 @@ void Connection::close() {
     if (state_ == State::Closed) return;
     state_ = State::Closed;
     log("[fd=" + std::to_string(fd_) + "] connection closed");
-    // 从 epoll 和连接表移除；对象本身延迟到事件循环末尾删除（防 use-after-free）
-    server_->removeConnection(fd_);
+    // 从 epoll 和连接表移除；对象本身延迟到本 loop 事件循环末尾删除（防 use-after-free）
+    loop_->removeConnection(fd_);
 }
 
 // 业务接口：发送任意一帧（服务端 → 客户端，不掩码）
@@ -274,7 +270,7 @@ void Connection::enqueue(const uint8_t* data, size_t len) {
 
 // 告诉 epoll："我既有数据要读，也有数据要发"
 void Connection::requestWrite() {
-    server_->modEvent(fd_, EPOLLIN | EPOLLOUT);
+    loop_->modEvent(fd_, EPOLLIN | EPOLLOUT);
 }
 
 // ---- 握手状态机 ----
@@ -339,12 +335,12 @@ void Connection::tryParseMessages() {
         if (frame.opcode == Opcode::Close ||
             frame.opcode == Opcode::Ping  ||
             frame.opcode == Opcode::Pong) {
-            server_->deliverMessage(this, frame);
+            loop_->deliverMessage(this, frame);
             if (frame.opcode == Opcode::Close) {
                 // 收到关闭帧：通知业务（demo 里会回一个 Close 帧），
                 // 然后进入"优雅关闭"：等写缓冲发完再真正关闭
                 closing_ = true;
-                server_->deliverClose(this);
+                loop_->deliverClose(this);
                 if (writeBuf_.empty()) close();   // 没东西要发了，直接关
                 break;                            // 不再解析后续数据
             }
@@ -372,7 +368,7 @@ void Connection::tryParseMessages() {
             complete.payload = std::move(fragBuf_);
             fragBuf_.clear();
             inFrag_ = false;
-            server_->deliverMessage(this, complete);   // 交付给业务回调
+            loop_->deliverMessage(this, complete);   // 交付给业务回调
         }
     }
 
@@ -383,60 +379,70 @@ void Connection::tryParseMessages() {
 }
 
 // ============================================================
-// Server（epoll + reactor 事件循环）
+// EventLoop（一个工作线程自己的事件循环）
 // ============================================================
-bool Server::start(const std::string& ip, uint16_t port) {
-    // ① 绑定监听端口
-    if (!listenSock_.bindAndListen(ip, port)) {
-        log("[Server] bind/listen failed on " + ip + ":" + std::to_string(port));
-        return false;
-    }
-    // 监听 socket 也必须非阻塞：这样 accept 没连接时返回 EAGAIN，不会卡住循环
-    listenSock_.setNonBlocking();
+EventLoop::EventLoop(Server* server, int idx) : server_(server), idx_(idx) {}
 
-    // ② 创建 epoll 实例
-    epollFd_ = ::epoll_create1(0);
-    if (epollFd_ < 0) {
-        log("[Server] epoll_create failed: " + std::string(std::strerror(errno)));
-        return false;
-    }
-
-    // ③ 把监听 socket 登记进 epoll：关心"可读"（= 有新连接到来）
-    epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = listenSock_.fd();
-    if (::epoll_ctl(epollFd_, EPOLL_CTL_ADD, listenSock_.fd(), &ev) < 0) {
-        log("[Server] epoll_ctl add listen failed");
-        return false;
-    }
-    log("[Server] Listening on " + ip + ":" + std::to_string(port) + " (epoll reactor)");
-    return true;
+EventLoop::~EventLoop() {
+    // 线程的回收由 Server::run 统一负责（stop + join）；
+    // 析构时线程必须已结束，否则是使用错误。
 }
 
-// 事件循环：唯一的线程在这里阻塞等待，直到进程退出
-void Server::run() {
-    const int MAX_EVENTS = 1024;
-    epoll_event events[MAX_EVENTS];   // 内核返回的就绪事件数组
+// 启动：创建 epoll + eventfd，并启动工作线程
+void EventLoop::start() {
+    // ① 本 loop 自己的 epoll 实例
+    epollFd_ = ::epoll_create1(0);
+    if (epollFd_ < 0) {
+        log("[loop#" + std::to_string(idx_) + "] epoll_create failed: " + std::strerror(errno));
+        return;
+    }
 
-    while (true) {
-        // 阻塞等待事件（-1 = 永远等，直到有事件）
+    // ② eventfd：跨线程唤醒"门铃"。
+    //    主线程要往本 loop 塞新连接时，如果本线程正阻塞在 epoll_wait 上，
+    //    只有往一个"本 loop 关心的 fd"写数据才能唤醒它——eventfd 就是干这个的。
+    //    EFD_NONBLOCK：读它时没计数就立刻返回，不阻塞。
+    wakeupFd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wakeupFd_ < 0) {
+        log("[loop#" + std::to_string(idx_) + "] eventfd failed: " + std::strerror(errno));
+        return;
+    }
+
+    // ③ 把门铃登记进自己的 epoll：关心"可读"（= 有人敲铃）
+    epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = wakeupFd_;
+    ::epoll_ctl(epollFd_, EPOLL_CTL_ADD, wakeupFd_, &ev);
+
+    // ④ 启动工作线程，线程主函数是 runInLoop
+    thread_ = std::thread(&EventLoop::runInLoop, this);
+}
+
+// 工作线程主函数：自己的 epoll_wait 事件循环（阻塞，直到 stop）
+void EventLoop::runInLoop() {
+    loopThreadId_ = std::this_thread::get_id();   // 记录"我是本 loop 的线程"
+    const int MAX_EVENTS = 1024;
+    epoll_event events[MAX_EVENTS];
+
+    while (!stop_) {   // stop_ 是原子变量：其他线程设 true 后本循环退出
+        // 阻塞等待本 loop 名下所有 fd 的事件（-1 = 永远等；被 eventfd 唤醒也会返回）
         int n = ::epoll_wait(epollFd_, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR) continue;   // 被信号打断，继续等
-            log("[Server] epoll_wait error: " + std::string(std::strerror(errno)));
+            log("[loop#" + std::to_string(idx_) + "] epoll_wait error: " + std::strerror(errno));
             break;
         }
+
         for (int i = 0; i < n; ++i) {
             epoll_event& ev = events[i];
             int fd = ev.data.fd;
 
-            // 监听 socket 可读 = 有客户端来连接
-            if (fd == listenSock_.fd()) {
-                acceptNew();
+            // 门铃响了：主线程往本 loop 塞了新连接 → 处理待办队列
+            if (fd == wakeupFd_) {
+                handleWakeup();
                 continue;
             }
 
-            // 查连接表，找不到说明已被删除，跳过
+            // 查本 loop 的连接表；找不到说明已被删除，跳过
             auto it = conns_.find(fd);
             if (it == conns_.end()) continue;
             Connection* c = it->second;
@@ -460,10 +466,192 @@ void Server::run() {
         pendingDelete_.clear();
     }
 
-    closeAll();   // 退出循环后清理所有连接
+    closeAll();   // 退出循环后清理本 loop 的所有连接
 }
 
-// 接受新连接（监听 socket 可读时调用）
+// 等待工作线程结束（Server::run 退出时调用）
+void EventLoop::join() {
+    if (thread_.joinable()) thread_.join();
+}
+
+// 请求退出（可被任意线程调用）：置标志 + 敲铃唤醒阻塞中的 epoll_wait
+void EventLoop::stop() {
+    stop_ = true;
+    wakeup();
+}
+
+// 跨线程安全：把新连接的 fd 交给本 loop 接管。
+// ① 锁内放进待办队列 ② 敲铃唤醒工作线程（它醒来后在 doPendingConns 里正式接管）
+void EventLoop::addConnection(int fd) {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        pendingConns_.push_back(fd);
+    }
+    wakeup();
+}
+
+// 敲铃：往 eventfd 写 8 字节计数。eventfd 是计数器，写几就加几，
+// 只要计数 > 0，epoll_wait 就会认为它"可读"并立即唤醒。
+void EventLoop::wakeup() {
+    uint64_t one = 1;
+    ssize_t n = ::write(wakeupFd_, &one, sizeof(one));
+    (void)n;   // 写失败（如已关闭）无所谓，忽略
+}
+
+// 门铃可读：清掉计数，然后处理待办队列
+void EventLoop::handleWakeup() {
+    uint64_t val = 0;
+    ssize_t n = ::read(wakeupFd_, &val, sizeof(val));  // eventfd 读一次即清零
+    (void)n;
+    doPendingConns();
+}
+
+// 把待办队列里的新连接全部正式接管：
+// 建 Connection 对象 → 登记进连接表 → 登记进本 loop 的 epoll
+void EventLoop::doPendingConns() {
+    // 锁内把队列"搬"出来（swap 是 O(1)，拿完立刻放锁，尽量减少持锁时间）
+    std::vector<int> fds;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        fds.swap(pendingConns_);
+    }
+
+    for (int fd : fds) {
+        Connection* c = new Connection(fd, this);   // 绑定本 loop
+        conns_[fd] = c;
+
+        // 登记进 epoll：初始只关心"可读"（客户端会先发握手请求）
+        epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        ::epoll_ctl(epollFd_, EPOLL_CTL_ADD, fd, &ev);
+
+        log("[loop#" + std::to_string(idx_) + "] New connection fd=" + std::to_string(fd));
+    }
+}
+
+int EventLoop::idx() const { return idx_; }
+
+// 判断调用者是否就是本 loop 的线程（防误用的调试工具）
+bool EventLoop::isInLoopThread() const {
+    return std::this_thread::get_id() == loopThreadId_;
+}
+
+// 修改某 fd 在 epoll 里关心的事件（EPOLL_CTL_MOD）
+void EventLoop::modEvent(int fd, uint32_t events) {
+    epoll_event ev;
+    ev.events = events;
+    ev.data.fd = fd;
+    ::epoll_ctl(epollFd_, EPOLL_CTL_MOD, fd, &ev);
+}
+
+// 从 epoll/连接表移除一个连接（对象延迟到本 loop 事件循环末尾删除）
+void EventLoop::removeConnection(int fd) {
+    auto it = conns_.find(fd);
+    if (it == conns_.end()) return;
+    Connection* c = it->second;
+
+    ::epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);  // 从 epoll 移除
+    ::close(fd);                                        // 关闭 socket
+    conns_.erase(it);                                   // 从连接表移除
+    pendingDelete_.push_back(c);                        // 对象进延迟删除队列
+}
+
+// 把消息帧转发给业务回调（回调在"本 loop 线程"里执行）
+void EventLoop::deliverMessage(Connection* c, const Frame& f) {
+    if (server_->onMsg_) server_->onMsg_(*c, f);
+}
+
+// 把关闭事件转发给业务回调
+void EventLoop::deliverClose(Connection* c) {
+    if (server_->onClose_) server_->onClose_(*c);
+}
+
+// 关闭本 loop 的所有连接（线程退出时调用）
+void EventLoop::closeAll() {
+    for (auto& kv : conns_) {
+        ::epoll_ctl(epollFd_, EPOLL_CTL_DEL, kv.first, nullptr);
+        ::close(kv.first);
+        delete kv.second;
+    }
+    conns_.clear();
+}
+
+// ============================================================
+// Server（主线程 Acceptor + 工作 loop 管理）
+// ============================================================
+bool Server::start(const std::string& ip, uint16_t port, int loopCount) {
+    // ① 绑定监听端口
+    if (!listenSock_.bindAndListen(ip, port)) {
+        log("[Server] bind/listen failed on " + ip + ":" + std::to_string(port));
+        return false;
+    }
+    // 监听 socket 也必须非阻塞：这样 accept 没连接时返回 EAGAIN，不会卡住循环
+    listenSock_.setNonBlocking();
+
+    // ② 主线程的 epoll（只登记监听 socket，只管"来新连接"这一件事）
+    mainEpollFd_ = ::epoll_create1(0);
+    if (mainEpollFd_ < 0) {
+        log("[Server] epoll_create failed: " + std::string(std::strerror(errno)));
+        return false;
+    }
+    epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = listenSock_.fd();
+    if (::epoll_ctl(mainEpollFd_, EPOLL_CTL_ADD, listenSock_.fd(), &ev) < 0) {
+        log("[Server] epoll_ctl add listen failed");
+        return false;
+    }
+
+    // ③ 创建工作线程（EventLoop）
+    if (loopCount <= 0) loopCount = (int)std::thread::hardware_concurrency();  // 自动 = CPU 核数
+    if (loopCount < 1) loopCount = 1;
+    if (loopCount > 64) loopCount = 64;   // 防呆：上限 64，避免误传超大数字
+    for (int i = 0; i < loopCount; ++i) {
+        EventLoop* loop = new EventLoop(this, i);
+        loops_.push_back(loop);
+        loop->start();   // 每个 loop 自己开一个线程
+    }
+
+    log("[Server] Listening on " + ip + ":" + std::to_string(port)
+        + " (One-Loop-Per-Thread, " + std::to_string(loopCount) + " loops)");
+    return true;
+}
+
+// 主线程事件循环：只 accept，然后 round-robin 分发给工作 loop
+void Server::run() {
+    const int MAX_EVENTS = 1024;
+    epoll_event events[MAX_EVENTS];
+
+    while (running_) {
+        // 500ms 超时：让 stop() 最多 500ms 内生效（有监听事件会立即返回）
+        int n = ::epoll_wait(mainEpollFd_, events, MAX_EVENTS, 500);
+        if (n < 0) {
+            if (errno == EINTR) continue;   // 被信号打断，继续等
+            log("[Server] epoll_wait error: " + std::string(std::strerror(errno)));
+            break;
+        }
+        for (int i = 0; i < n; ++i) {
+            // 主线程只关心监听 socket：有新连接就 accept 并分发
+            if (events[i].data.fd == listenSock_.fd()) acceptNew();
+        }
+    }
+
+    // 主循环退出：先通知所有工作线程停止，再等它们结束并回收
+    for (EventLoop* loop : loops_) loop->stop();
+    for (EventLoop* loop : loops_) {
+        loop->join();
+        delete loop;
+    }
+    loops_.clear();
+}
+
+// 请求退出（可被任意线程调用；run 最多 500ms 后返回并清理）
+void Server::stop() {
+    running_ = false;
+}
+
+// 接受新连接（监听 socket 可读时调用，只在本线程执行）
 void Server::acceptNew() {
     while (true) {
         sockaddr_in peer{};
@@ -481,61 +669,24 @@ void Server::acceptNew() {
         int flags = ::fcntl(cfd, F_GETFL, 0);
         ::fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
 
-        // 创建 Connection，登记进连接表
-        Connection* c = new Connection(cfd, this);
-        conns_[cfd] = c;
+        // ★ One-Loop-Per-Thread 的关键一步：负载均衡，把新连接交给某个工作 loop
+        //   这个调用是跨线程的（主线程 → 工作线程），EventLoop::addConnection 内部
+        //   用"待办队列 + eventfd 唤醒"完成线程间交接。
+        EventLoop* loop = nextLoop();
+        loop->addConnection(cfd);
 
-        // 登记进 epoll：初始只关心"可读"（客户端会先发握手请求）
-        epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.fd = cfd;
-        ::epoll_ctl(epollFd_, EPOLL_CTL_ADD, cfd, &ev);
-
-        log("[Server] New connection fd=" + std::to_string(cfd));
+        log("[Server] fd=" + std::to_string(cfd) + " -> loop#" + std::to_string(loop->idx()));
     }
 }
 
-// 修改某 fd 在 epoll 里关心的事件（EPOLL_CTL_MOD）
-void Server::modEvent(int fd, uint32_t events) {
-    epoll_event ev;
-    ev.events = events;
-    ev.data.fd = fd;
-    ::epoll_ctl(epollFd_, EPOLL_CTL_MOD, fd, &ev);
-}
-
-// 从 epoll/连接表移除一个连接（对象延迟到事件循环末尾删除）
-void Server::removeConnection(int fd) {
-    auto it = conns_.find(fd);
-    if (it == conns_.end()) return;
-    Connection* c = it->second;
-
-    ::epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);  // 从 epoll 移除
-    ::close(fd);                                        // 关闭 socket
-    conns_.erase(it);                                   // 从连接表移除
-    pendingDelete_.push_back(c);                        // 对象进延迟删除队列
-}
-
-// 把消息帧转发给业务回调
-void Server::deliverMessage(Connection* c, const Frame& f) {
-    if (onMsg_) onMsg_(*c, f);
-}
-
-// 把关闭事件转发给业务回调
-void Server::deliverClose(Connection* c) {
-    if (onClose_) onClose_(*c);
+// round-robin（轮流）：第 0,1,2,...,N-1,0,1,... 个 loop，让负载尽量均匀
+EventLoop* Server::nextLoop() {
+    EventLoop* loop = loops_[nextLoopIdx_ % loops_.size()];
+    ++nextLoopIdx_;
+    return loop;
 }
 
 void Server::setOnMessage(std::function<void(Connection&, const Frame&)> cb) { onMsg_ = std::move(cb); }
 void Server::setOnClose(std::function<void(Connection&)> cb) { onClose_ = std::move(cb); }
-
-// 关闭所有连接（事件循环退出时调用）
-void Server::closeAll() {
-    for (auto& kv : conns_) {
-        ::epoll_ctl(epollFd_, EPOLL_CTL_DEL, kv.first, nullptr);
-        ::close(kv.first);
-        delete kv.second;
-    }
-    conns_.clear();
-}
 
 }
