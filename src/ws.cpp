@@ -337,16 +337,17 @@ void Connection::tryParseMessages() {
             frame.opcode == Opcode::Pong) {
             loop_->deliverMessage(this, frame);
             if (frame.opcode == Opcode::Close) {
-                // 收到关闭帧：通知业务（demo 里会回一个 Close 帧），
-                // 然后进入"优雅关闭"：等写缓冲发完再真正关闭
-                closing_ = true;
-                loop_->deliverClose(this);
-                if (writeBuf_.empty()) close();   // 没东西要发了，直接关
-                break;                            // 不再解析后续数据
+                loop_->deliverClose(this);       // 用户onClose回调，用户可选择自定义code/reason调用replyCloseFrame
+                if (!closing_) {      
+                    replyCloseFrame(1000, "");  // 用户没有回复Close帧，框架自动回复标准1000关闭
+                }
+                if (writeBuf_.empty()) {
+                    close();                    // 没东西要发了，直接关
+                }
+                break;                          // 停止解析后续输入字节，协议强制
             }
             continue;
         }
-
         // ---- 数据帧分片重组（逻辑与之前线程版一致）----
         if (frame.opcode == Opcode::Cont) {
             if (!inFrag_) {   // 没有首帧就来续帧 = 协议错误
