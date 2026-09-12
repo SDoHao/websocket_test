@@ -4,6 +4,9 @@
 #include <fstream>
 #include <vector>
 #include <string>
+#include <thread>
+#include <chrono>
+#include <poll.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #endif
@@ -16,19 +19,28 @@
 //      -f <文件>   发送二进制文件（jpg 图传，服务端原样回显）
 //      -t <文本>   发送文本消息（服务端原样回显）
 //      -p          测试心跳（发 Ping，等服务端回 Pong）
+//      -m [秒]    指令超时测试：发 MOVE，等服务端下发 CMD，
+//                  延迟 N 秒后回 ACK（默认 1 秒；填 0 = 不回 ACK，测超时）
+//      -k [秒]    心跳保活测试：连接后保持 N 秒不发数据，
+//                  观察服务端是否因超时主动断开（默认 15 秒）
 //  示例：
 //      ./ws_client -f 0.jpg
 //      ./ws_client 127.0.0.1 8080 -t "hello websocket"
 //      ./ws_client -p
+//      ./ws_client -m 2        （2 秒后回 ACK，测正常流程）
+//      ./ws_client -m 0        （不回 ACK，测指令超时重发）
+//      ./ws_client -k 15       （15 秒不发数据，测心跳超时断开）
 // ============================================================
 
 // 命令行参数（解析结果存这里）
 struct Args {
     std::string host = "127.0.0.1";   // 服务器地址（默认本机）
     uint16_t port = 8080;             // 服务器端口（默认 8080）
-    enum Mode { None, File, Text, Ping } mode = None;  // 要执行的操作
+    enum Mode { None, File, Text, Ping, Move, Keepalive } mode = None;
     std::string file;                 // -f 的文件路径
     std::string text;                 // -t 的文本内容
+    int moveAckDelay = 1;             // -m：收到 CMD 后多少秒回 ACK（0=不回）
+    int keepaliveSecs = 15;           // -k：保持连接多少秒
 };
 
 // 打印用法说明
@@ -39,10 +51,15 @@ static void printUsage() {
         "    -f <文件>   发送二进制文件（jpg 图传）\n"
         "    -t <文本>   发送文本消息\n"
         "    -p          测试心跳（Ping/Pong）\n"
+        "    -m [秒]    指令超时测试（默认 1 秒后回 ACK；0=不回 ACK，测超时）\n"
+        "    -k [秒]    心跳保活测试（默认 15 秒，测服务端超时断开）\n"
         "  示例:\n"
         "    ./ws_client -f 0.jpg\n"
         "    ./ws_client 127.0.0.1 8080 -t hello\n"
-        "    ./ws_client -p\n";
+        "    ./ws_client -p\n"
+        "    ./ws_client -m 2        （2 秒后回 ACK）\n"
+        "    ./ws_client -m 0        （不回 ACK，测指令超时重发）\n"
+        "    ./ws_client -k 15       （15 秒不发数据，测心跳超时）\n";
 }
 
 // 解析命令行参数
@@ -61,6 +78,24 @@ static bool parseArgs(int argc, char** argv, Args& args) {
             args.text = argv[++i];        // 选项带一个参数：文本内容
         } else if (a == "-p") {
             args.mode = Args::Ping;       // 无参数选项：测心跳
+        } else if (a == "-m") {
+            args.mode = Args::Move;
+            // -m 可带一个可选参数：延迟秒数（默认 1）
+            if (i + 1 < argc) {
+                std::string next = argv[i + 1];
+                if (!next.empty() && (next[0] >= '0' && next[0] <= '9')) {
+                    args.moveAckDelay = std::stoi(argv[++i]);
+                }
+            }
+        } else if (a == "-k") {
+            args.mode = Args::Keepalive;
+            // -k 可带一个可选参数：持续秒数（默认 15）
+            if (i + 1 < argc) {
+                std::string next = argv[i + 1];
+                if (!next.empty() && (next[0] >= '0' && next[0] <= '9')) {
+                    args.keepaliveSecs = std::stoi(argv[++i]);
+                }
+            }
         } else if (a == "-h" || a == "--help") {
             printUsage();
             return false;
@@ -191,6 +226,112 @@ static bool testPing(ws::Client& client) {
     return false;
 }
 
+// ------------------------------------------------------------
+// 功能 4：指令超时测试（-m）
+// 发 MOVE → 服务端下发 CMD:MOVE → 延迟 N 秒后回 ACK（或不回，测超时）
+// 持续读帧，观察服务端的指令下发 / 重发 / 超时报错
+// ------------------------------------------------------------
+static bool testMoveTimeout(ws::Client& client, int ackDelay) {
+    // ① 发送 MOVE 指令，触发服务端启动指令超时定时器
+    if (!client.sendText("MOVE")) {
+        std::cerr << "发送 MOVE 失败\n";
+        return false;
+    }
+    std::cout << "已发送 MOVE，等待服务端下发 CMD...\n";
+
+    bool ackSent = false;
+    bool gotError = false;
+    int round = 0;
+
+    // ② 循环读帧，观察服务端行为
+    while (true) {
+        ws::Frame frame;
+        if (!client.readFrame(frame)) {
+            std::cerr << "连接已断开（可能是服务端超时关闭）\n";
+            break;
+        }
+        if (frame.opcode == ws::Opcode::Close) {
+            std::cout << "服务端发送 Close 帧\n";
+            break;
+        }
+        if (frame.opcode != ws::Opcode::Text) continue;
+
+        std::string text(frame.payload.begin(), frame.payload.end());
+        round++;
+        std::cout << "[recv #" << round << "] " << text << "\n";
+
+        // 收到 CMD:MOVE → 按 ackDelay 决定是否回 ACK
+        if (text.rfind("CMD:MOVE", 0) == 0 && !ackSent) {
+            if (ackDelay > 0) {
+                std::cout << "收到指令，等待 " << ackDelay
+                          << " 秒后回 ACK...\n";
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(ackDelay));
+                client.sendText("ACK");
+                std::cout << "已发送 ACK\n";
+                ackSent = true;
+            } else {
+                std::cout << "收到指令，故意不回 ACK（测试超时重发）...\n";
+                // ackDelay=0 → 不回 ACK，让服务端超时重发
+            }
+        }
+
+        // 收到 OK:ACK_RECEIVED → 流程完成
+        if (text == "OK:ACK_RECEIVED") {
+            std::cout << "\n[OK] 指令流程完成（ACK 已被服务端确认）\n";
+            break;
+        }
+
+        // 收到 ERROR → 超时报错
+        if (text.rfind("ERROR", 0) == 0) {
+            std::cout << "\n[ERROR] 服务端报错: " << text << "\n";
+            gotError = true;
+            break;
+        }
+    }
+    return !gotError;
+}
+
+// ------------------------------------------------------------
+// 功能 5：心跳保活测试（-k）
+// 连接后保持 N 秒不发任何数据，观察服务端心跳超时是否主动断开
+// ------------------------------------------------------------
+static bool testKeepalive(ws::Client& client, int secs) {
+    std::cout << "连接已建立，保持 " << secs << " 秒不发数据...\n";
+    std::cout << "（服务端每 5 秒检查一次，超过 10 秒无活跃将断开）\n\n";
+
+    int fd = client.fd();
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= secs) {
+            std::cout << "\n[OK] 存活 " << secs << " 秒，测试结束\n";
+            return true;
+        }
+
+        // 用 poll 检查服务端是否断开（1 秒超时）
+        // 如果 socket 可读但 readFrame 返回 false → 服务端关闭了连接
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        int ret = ::poll(&pfd, 1, 1000);  // 1 秒超时
+
+        if (ret > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+            // socket 有事件 → 尝试读一帧
+            ws::Frame frame;
+            if (!client.readFrame(frame)) {
+                // 读失败 → 服务端断开了连接
+                std::cout << "\n[服务端断开] 连接已被服务端心跳超时关闭 (elapsed="
+                          << elapsed << "s)\n";
+                return false;
+            }
+            // 收到数据 → 忽略（心跳测试不关心内容）
+        }
+        std::cout << "  [" << elapsed + 1 << "s] 仍连接...\n" << std::flush;
+    }
+}
+
 // ============================================================
 //  main：解析参数 → 连接 → 握手 → 按模式分发给功能函数
 // ============================================================
@@ -229,10 +370,12 @@ int main(int argc, char** argv) {
     // ④ 按模式分发
     bool ok = false;
     switch (args.mode) {
-        case Args::File: ok = sendFile(client, args.file); break;
-        case Args::Text: ok = sendText(client, args.text); break;
-        case Args::Ping: ok = testPing(client);            break;
-        default:         ok = false;                       break;
+        case Args::File:      ok = sendFile(client, args.file);         break;
+        case Args::Text:      ok = sendText(client, args.text);         break;
+        case Args::Ping:      ok = testPing(client);                    break;
+        case Args::Move:      ok = testMoveTimeout(client, args.moveAckDelay); break;
+        case Args::Keepalive: ok = testKeepalive(client, args.keepaliveSecs); break;
+        default:              ok = false;                               break;
     }
 
 #ifdef _WIN32

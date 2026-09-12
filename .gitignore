@@ -1,3 +1,6 @@
 build
 tar_archive
 ARCHITECTURE.md
+ws_client
+ws_server
+server.log

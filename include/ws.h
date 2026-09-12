@@ -6,7 +6,10 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <queue>
+#include <unordered_set>
 #include <cstdint>
+#include <utility>
 
 namespace ws {
 void log(const std::string& s);
@@ -46,6 +49,7 @@ bool parseFrameFromBuf(const std::vector<uint8_t>& buf, size_t& offset, Frame& f
 
 class Server;    // 前置声明：Connection/EventLoop 里要用指针
 class EventLoop; // 前置声明：Connection 里要用指针
+class TimerQueue;// 前置声明
 
 // ============================================================
 // 服务端连接（非阻塞状态机版，One-Loop-Per-Thread）
@@ -70,6 +74,9 @@ public:
 
     int fd() const;
     State state() const;
+    EventLoop* loop() { return loop_; }   // 业务回调里通过 loop()->addTimer/cancelTimer 操作定时器
+    bool onCloseFired() const { return onCloseFired_; }
+    void markCloseFired() { onCloseFired_ = true; }
 
     // ---- 事件入口（只由所属 EventLoop 的事件循环调用）----
     void handleRead();   // socket 可读：recv 数据进读缓冲，然后尝试解析
@@ -80,6 +87,10 @@ public:
     bool sendFrame(Opcode op, const uint8_t* data, size_t len);           // 发任意一帧
     bool sendText(const std::string& text);                               // 发文本帧
     bool replyCloseFrame(uint16_t code = 1000, const std::string& reason = ""); // 回关闭帧
+
+    // 业务侧可自由挂载的 per-连接上下文（类型擦除，回调里自行 any_cast）。
+    // 典型用法：存"上次活跃时间""待 ack 指令"等，供定时器回调读取。
+    std::shared_ptr<void> userData;
 
 private:
     void tryHandshake();       // 尝试从读缓冲解析握手请求头（数据不足就等下次）
@@ -103,6 +114,52 @@ private:
     // ---- 握手/关闭状态 ----
     std::string reqRaw_;              // 累积收到的握手请求字节（收到 \r\n\r\n 前）
     bool closing_ = false;            // 已收到 Close 帧：等写缓冲发完再真正关闭（优雅关闭）
+    bool onCloseFired_ = false;       // onClose 回调是否已触发（保证只触发一次）
+};
+
+// ============================================================
+// TimerQueue：基于 timerfd + 最小堆的定时器（每个 EventLoop 一个实例）
+// ============================================================
+// 原理：
+//   - 每个 EventLoop 持有一个 TimerQueue，内部只有一个 timerfd，挂到 epoll 上
+//   - 所有定时任务存入最小堆（按到期时间排序），timerfd 总是对准最早的那个
+//   - timerfd 可读 → 到期了一批任务 → 取出所有已过期的执行 → 重新设为下一个最早到期时间
+//   - 线程安全：TimerQueue 只在所属 EventLoop 线程内被调用（addTimer/cancelTimer/handleExpired）
+//     跨线程添加定时器请走 EventLoop::runInLoop（eventfd 唤醒后在 loop 线程内执行）
+// 定时器 ID：
+//   - 全局递增（atomic），即使被 cancel 也永不复用 → 调用方靠 ID 取消
+class TimerQueue {
+public:
+    using Callback = std::function<void()>;
+
+    TimerQueue() = default;
+    ~TimerQueue();
+
+    bool init();  // 创建 timerfd（只调用一次）
+    int fd() const { return timerFd_; }
+
+    // 添加一个定时器，delayMs 毫秒后触发 cb；返回唯一 timerId（>0）。
+    uint64_t addTimer(uint64_t delayMs, Callback cb);
+    // 取消定时器（找到并标记取消，惰性删除）；返回是否成功找到。
+    bool cancelTimer(uint64_t timerId);
+    // timerfd 可读时调用：弹出所有过期定时器并执行回调，重新 arm timerfd。
+    void handleExpired();
+
+private:
+    struct Entry {
+        uint64_t when;      // 到期时间点（ms since epoch，steady_clock）
+        uint64_t id;        // 定时器 ID
+        Callback cb;
+        bool operator>(const Entry& o) const { return when > o.when; }
+    };
+
+    int timerFd_ = -1;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> heap_;
+    std::unordered_set<uint64_t> cancelled_;   // 已取消的定时器 ID 集合（惰性删除）
+    static std::atomic<uint64_t> s_nextId_;
+
+    void resetTimerfd();   // 把 timerfd 的超时设为堆顶时间（或取消定时）
+    static uint64_t nowMs();
 };
 
 // ============================================================
@@ -136,6 +193,12 @@ public:
     void removeConnection(int fd);          // 从 epoll/连接表移除；对象延迟删除
     void deliverMessage(Connection* c, const Frame& f); // 转发给业务回调
     void deliverClose(Connection* c);                   // 转发给关闭回调
+    void deliverConnect(Connection* c);                 // 转发给连接建立回调
+
+    // 定时器：在所属 loop 线程内添加/取消定时器。
+    // 返回 timerId（>0），可用于取消。必须在本 loop 线程内调用。
+    uint64_t addTimer(uint64_t delayMs, TimerQueue::Callback cb);
+    bool cancelTimer(uint64_t timerId);
 
 private:
     void wakeup();        // 往 eventfd 写 1 字节计数（唤醒阻塞中的 epoll_wait）
@@ -156,6 +219,8 @@ private:
 
     std::unordered_map<int, Connection*> conns_;  // fd → Connection（本线程独享）
     std::vector<Connection*> pendingDelete_;      // 延迟删除队列（本线程独享）
+
+    TimerQueue timerQueue_;    // 本 loop 的定时器（timerfd + 最小堆）
 };
 
 // ============================================================
@@ -176,6 +241,7 @@ public:
 
     void setOnMessage(std::function<void(Connection&, const Frame&)> cb); // 注册收消息回调
     void setOnClose(std::function<void(Connection&)> cb);                 // 注册关闭回调
+    void setOnConnect(std::function<void(Connection&)> cb);              // 注册新连接回调
 
 private:
     void acceptNew();        // 接受新连接并分发给某个工作 loop
@@ -189,6 +255,7 @@ private:
 
     std::function<void(Connection&, const Frame&)> onMsg_;
     std::function<void(Connection&)> onClose_;
+    std::function<void(Connection&)> onConnect_;
 
     friend class EventLoop;  // EventLoop 需要读取上面的回调（deliverMessage 转发用）
 };

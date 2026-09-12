@@ -22,6 +22,7 @@
 #include <fcntl.h>         // fcntl() / O_NONBLOCK
 #include <sys/epoll.h>     // epoll 系列 API（Linux 专属）
 #include <sys/eventfd.h>   // eventfd()：跨线程唤醒"门铃"（Linux 专属）
+#include <sys/timerfd.h>   // timerfd_create / timerfd_settime（Linux 专属）
 #include <sys/socket.h>    // accept/recv/send
 #include <arpa/inet.h>     // sockaddr_in
 #include <netinet/in.h>
@@ -36,7 +37,7 @@ static constexpr size_t kWriteBufReclaimBytes = 1024 * 1024;
 
 void log(const std::string& s) {
     std::lock_guard<std::mutex> lock(g_log_mtx);
-    std::cout << s << "\n";
+    std::cout << s << "\n" << std::flush;
 }
 
 // ============================================================
@@ -163,6 +164,78 @@ bool parseFrameFromBuf(const std::vector<uint8_t>& buf, size_t& offset, Frame& f
 }
 
 // ============================================================
+// TimerQueue（基于 timerfd + 最小堆的定时器）
+// ============================================================
+std::atomic<uint64_t> TimerQueue::s_nextId_{1};
+
+TimerQueue::~TimerQueue() {
+    if (timerFd_ >= 0) ::close(timerFd_);
+}
+
+bool TimerQueue::init() {
+    timerFd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timerFd_ < 0) {
+        log("[TimerQueue] timerfd_create failed: " + std::string(std::strerror(errno)));
+        return false;
+    }
+    return true;
+}
+
+uint64_t TimerQueue::nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+uint64_t TimerQueue::addTimer(uint64_t delayMs, Callback cb) {
+    uint64_t id = s_nextId_.fetch_add(1);
+    uint64_t when = nowMs() + delayMs;
+    heap_.push(Entry{when, id, std::move(cb)});
+    resetTimerfd();   // 新任务可能更早到期，重新对准 timerfd
+    return id;
+}
+
+bool TimerQueue::cancelTimer(uint64_t timerId) {
+    if (timerId == 0) return false;
+    // 惰性删除：把 ID 插入集合，等 handleExpired 弹出到这个 ID 时跳过执行。
+    cancelled_.insert(timerId);
+    return true;
+}
+
+void TimerQueue::handleExpired() {
+    // 先读 timerfd，清掉可读状态（不读会一直触发）
+    uint64_t val;
+    ::read(timerFd_, &val, sizeof(val));
+
+    uint64_t now = nowMs();
+    // 弹出所有已到期的定时器
+    while (!heap_.empty() && heap_.top().when <= now) {
+        Entry e = heap_.top();
+        heap_.pop();
+        // erase 返回删了几个：1=在集合里（已取消）→ 跳过；0=不在 → 执行
+        if (cancelled_.erase(e.id)) continue;
+        if (e.cb) e.cb();   // 执行回调
+    }
+    resetTimerfd();   // 重新对准下一个最早到期时间
+}
+
+void TimerQueue::resetTimerfd() {
+    struct itimerspec its{};
+    if (!heap_.empty()) {
+        uint64_t now = nowMs();
+        uint64_t when = heap_.top().when;
+        if (when > now) {
+            its.it_value.tv_sec = (when - now) / 1000;
+            its.it_value.tv_nsec = ((when - now) % 1000) * 1000000;
+        } else {
+            // 已过期：立即触发（设 1ns）
+            its.it_value.tv_nsec = 1;
+        }
+    }
+    // it_value 全 0 = 取消定时（堆空时）
+    ::timerfd_settime(timerFd_, 0, &its, nullptr);
+}
+
+// ============================================================
 // Connection（非阻塞状态机版，绑定所属 EventLoop）
 // ============================================================
 Connection::Connection(int fd, EventLoop* loop) : fd_(fd), loop_(loop) {}
@@ -235,6 +308,9 @@ void Connection::close() {
     if (state_ == State::Closed) return;
     state_ = State::Closed;
     log("[fd=" + std::to_string(fd_) + "] connection closed");
+    // 通知业务层：连接即将关闭（无论是因为收到 Close 帧、对端断开、还是主动 close）
+    // → 让 onConnect 启动的定时器有机会在 onClose 里被 cancelTimer
+    loop_->deliverClose(this);
     // 从 epoll 和连接表移除；对象本身延迟到本 loop 事件循环末尾删除（防 use-after-free）
     loop_->removeConnection(fd_);
 }
@@ -317,6 +393,9 @@ void Connection::tryHandshake() {
     enqueue(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
     state_ = State::Reading;
     log("[fd=" + std::to_string(fd_) + "] Handshake succeeded");
+
+    // 通知业务层：新连接已建立（握手成功）→ 可在这里启动 per-connection 定时器
+    loop_->deliverConnect(this);
 
     // 注意：浏览器的握手请求里可能紧跟着就带了数据帧（一个 TCP 包全发过来了），
     // 所以要继续尝试解析剩余数据，别丢帧。
@@ -414,7 +493,15 @@ void EventLoop::start() {
     ev.data.fd = wakeupFd_;
     ::epoll_ctl(epollFd_, EPOLL_CTL_ADD, wakeupFd_, &ev);
 
-    // ④ 启动工作线程，线程主函数是 runInLoop
+    // ④ 初始化定时器：创建 timerfd 并登记进 epoll
+    if (timerQueue_.init()) {
+        epoll_event tev;
+        tev.events = EPOLLIN;
+        tev.data.fd = timerQueue_.fd();
+        ::epoll_ctl(epollFd_, EPOLL_CTL_ADD, timerQueue_.fd(), &tev);
+    }
+
+    // ⑤ 启动工作线程，线程主函数是 runInLoop
     thread_ = std::thread(&EventLoop::runInLoop, this);
 }
 
@@ -440,6 +527,12 @@ void EventLoop::runInLoop() {
             // 门铃响了：主线程往本 loop 塞了新连接 → 处理待办队列
             if (fd == wakeupFd_) {
                 handleWakeup();
+                continue;
+            }
+
+            // 定时器到期：timerfd 可读 → 执行到期回调
+            if (fd == timerQueue_.fd()) {
+                timerQueue_.handleExpired();
                 continue;
             }
 
@@ -563,9 +656,25 @@ void EventLoop::deliverMessage(Connection* c, const Frame& f) {
     if (server_->onMsg_) server_->onMsg_(*c, f);
 }
 
-// 把关闭事件转发给业务回调
+// 把关闭事件转发给业务回调（幂等：同一连接只触发一次）
 void EventLoop::deliverClose(Connection* c) {
+    if (c->onCloseFired()) return;   // 已触发过，不重复
+    c->markCloseFired();
     if (server_->onClose_) server_->onClose_(*c);
+}
+
+// 把新连接事件转发给业务回调（握手成功后触发）
+void EventLoop::deliverConnect(Connection* c) {
+    if (server_->onConnect_) server_->onConnect_(*c);
+}
+
+// 定时器：在所属 loop 线程内添加定时器（回调也在本 loop 线程内执行）
+uint64_t EventLoop::addTimer(uint64_t delayMs, TimerQueue::Callback cb) {
+    return timerQueue_.addTimer(delayMs, std::move(cb));
+}
+
+bool EventLoop::cancelTimer(uint64_t timerId) {
+    return timerQueue_.cancelTimer(timerId);
 }
 
 // 关闭本 loop 的所有连接（线程退出时调用）
@@ -689,5 +798,6 @@ EventLoop* Server::nextLoop() {
 
 void Server::setOnMessage(std::function<void(Connection&, const Frame&)> cb) { onMsg_ = std::move(cb); }
 void Server::setOnClose(std::function<void(Connection&)> cb) { onClose_ = std::move(cb); }
+void Server::setOnConnect(std::function<void(Connection&)> cb) { onConnect_ = std::move(cb); }
 
 }
