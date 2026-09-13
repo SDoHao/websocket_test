@@ -15,6 +15,10 @@
   - `-t <文本>` 文本消息
   - `-p` 心跳测试（Ping/Pong）
 - **浏览器测试页** `index.html`：选 jpg 发送二进制帧并渲染回显图片
+- **定时器：timerfd + 最小堆**（每个工作线程一个）
+  - 业务接口 `EventLoop::addTimer / cancelTimer`，回调在本 loop 线程执行
+  - 底层一个 timerfd 永远对准最小堆堆顶，1000 个任务共享 1 个 timerfd
+  - 保姆级教程见 `TIMER_TUTORIAL.md`，可运行示例见 `demo/`
 
 ## 架构
 
@@ -41,6 +45,8 @@ cmake -S . -B build && cmake --build build
 ```
 
 > 服务端依赖 Linux 专有的 `epoll` 和 `eventfd`，无法在 Windows 原生编译运行。
+>
+> `./build.sh` 还会一并编译 `demo/` 下的两个 timerfd 教学示例（`timerfd_demo` / `timerfd_epoll_demo`）。
 
 ## 运行
 
@@ -58,22 +64,34 @@ cmake -S . -B build && cmake --build build
 
 浏览器测试：起服务端后打开 `index.html`，连接 `ws://127.0.0.1:8080`。
 
+## timerfd 定时器教程
+
+- **`TIMER_TUTORIAL.md`**：定时器保姆级教程（v2 深度版，timerfd 标准流程对齐 TCP 六步）
+  - 第四章：timerfd 标准流程逐个系统调用详解（`timerfd_create` → `timerfd_settime` → `read` → `close`）
+  - 第七章：真正使用 timerfd 的可运行示例（阻塞版 + epoll 版，复现多定时器场景）
+  - 第十章：timerfd 底层系统调用速查表
+- **`demo/`**：教程配套示例源码，`./build.sh` 自动编译出 `timerfd_demo` 和 `timerfd_epoll_demo`
+
 ## 目录结构
 
 ```
 ├── include/
 │   ├── net.h          # TCP 网络层（RAII + 非阻塞设置）
-│   ├── ws.h           # 协议层：Connection 状态机 / EventLoop / Server
+│   ├── ws.h           # 协议层：Connection 状态机 / EventLoop / Server / TimerQueue
 │   ├── ws_client.h    # 客户端（阻塞模式）
 │   └── ws_utils.h     # 工具层：SHA1 / Base64
 ├── src/
 │   ├── net.cpp
-│   ├── ws.cpp         # 核心：帧解析 + 事件循环 + 多线程分发
+│   ├── ws.cpp         # 核心：帧解析 + 事件循环 + TimerQueue + 多线程分发
 │   ├── ws_client.cpp
 │   └── ws_utils.cpp
+├── demo/
+│   ├── timerfd_demo.cpp        # timerfd 最小生命周期（阻塞版，4 个系统调用）
+│   └── timerfd_epoll_demo.cpp  # timerfd + epoll + 最小堆（TimerQueue 教学版）
 ├── ws_server.cpp      # 服务端入口（echo 服务器）
 ├── ws_client.cpp      # 客户端入口（参数循环）
-└── index.html         # 浏览器测试页
+├── index.html         # 浏览器测试页
+└── TIMER_TUTORIAL.md  # 定时器保姆级教程（timerfd 深度版）
 ```
 
 ## 说明

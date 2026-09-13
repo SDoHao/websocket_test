@@ -7,17 +7,21 @@ if ld -lstdc++ --verbose 2>/dev/null | grep -q "succeeded"; then
     echo "🔨 使用原始命令编译（静态链接 libstdc++）..."
     g++ -std=c++17 -pthread -O2 -static-libstdc++ -static-libgcc -Iinclude src/*.cpp ws_server.cpp -o ws_server
     g++ -std=c++17 -pthread -O2 -static-libstdc++ -static-libgcc -Iinclude src/*.cpp ws_client.cpp -o ws_client
+    g++ -std=c++17 -O2 demo/timerfd_demo.cpp -o timerfd_demo
+    g++ -std=c++17 -O2 demo/timerfd_epoll_demo.cpp -o timerfd_epoll_demo
 else
     echo "⚠️ 静态库不可用，使用备用命令（显式链接 .so.6）..."
     g++ -std=c++17 -pthread -O2 -static-libgcc -Iinclude src/*.cpp ws_server.cpp -o ws_server /usr/lib64/libstdc++.so.6
     g++ -std=c++17 -pthread -O2 -static-libgcc -Iinclude src/*.cpp ws_client.cpp -o ws_client /usr/lib64/libstdc++.so.6
+    g++ -std=c++17 -O2 demo/timerfd_demo.cpp -o timerfd_demo
+    g++ -std=c++17 -O2 demo/timerfd_epoll_demo.cpp -o timerfd_epoll_demo
 fi
 # windows
 # g++ -std=c++17 -O2 -Iinclude src/*.cpp ws_server.cpp -o ws_server.exe -lws2_32 -pthread 
 # g++ -std=c++17 -O2 -Iinclude src/*.cpp ws_client.cpp -o ws_client.exe -lws2_32 -pthread
 
 if [ $? -eq 0 ]; then
-    echo "✅ 编译成功！可执行文件: ./ws_server ./ws_client"
+    echo "✅ 编译成功！可执行文件: ./ws_server ./ws_client ./timerfd_demo ./timerfd_epoll_demo"
     echo "🚀 运行服务端: ./ws_server 8080"
     echo "🚀 运行客户端: ./ws_client 127.0.0.1 8080 \"hello websocket\""
 else
